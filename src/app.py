@@ -5,11 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, status, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import uuid
+import hashlib
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -77,6 +80,96 @@ activities = {
     }
 }
 
+# In-memory users database (simple demo)
+users = {
+    "admin": {
+        "password_hash": hashlib.sha256("admin123".encode()).hexdigest(),
+        "role": "admin",
+        "email": "admin@mergington.edu"
+    },
+    "teacher1": {
+        "password_hash": hashlib.sha256("teacher123".encode()).hexdigest(),
+        "role": "staff",
+        "email": "teacher1@mergington.edu"
+    },
+    "student1": {
+        "password_hash": hashlib.sha256("student123".encode()).hexdigest(),
+        "role": "student",
+        "email": "student1@mergington.edu"
+    }
+}
+
+api_tokens = {}  # token -> username
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def get_current_user(token: str = Header(None)):
+    if not token or token not in api_tokens:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing auth token")
+
+    username = api_tokens[token]
+    user = users.get(username)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    return {"username": username, "role": user["role"], "email": user["email"]}
+
+
+def require_role(current_user: dict, allowed_roles):
+    if current_user["role"] not in allowed_roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient privileges")
+
+
+@app.post("/login")
+def login(payload: LoginRequest):
+    user = users.get(payload.username)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+
+    if user["password_hash"] != hashlib.sha256(payload.password.encode()).hexdigest():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+
+    token = str(uuid.uuid4())
+    api_tokens[token] = payload.username
+    return {"token": token, "role": user["role"], "username": payload.username}
+
+
+@app.post("/logout")
+def logout(token: str = Header(None)):
+    if token in api_tokens:
+        del api_tokens[token]
+    return {"message": "Logged out"}
+
+
+@app.get("/me")
+def me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+
+@app.post("/users")
+def create_user(username: str, password: str, role: str = "student", current_user: dict = Depends(get_current_user)):
+    require_role(current_user, ["admin"])
+
+    if username in users:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    users[username] = {
+        "password_hash": hashlib.sha256(password.encode()).hexdigest(),
+        "role": role,
+        "email": f"{username}@mergington.edu"
+    }
+
+    return {"message": "User created", "user": {"username": username, "role": role}}
+
+
+@app.get("/users")
+def list_users(current_user: dict = Depends(get_current_user)):
+    require_role(current_user, ["admin"])
+    return {"users": [{"username": u, "role": d["role"], "email": d["email"]} for u, d in users.items()]}
+
 
 @app.get("/")
 def root():
@@ -89,8 +182,10 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, current_user: dict = Depends(get_current_user)):
     """Sign up a student for an activity"""
+    require_role(current_user, ["student", "staff", "admin"])
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -98,20 +193,45 @@ def signup_for_activity(activity_name: str, email: str):
     # Get the specific activity
     activity = activities[activity_name]
 
+    # Determine email for signup; students sign themselves, staff/admin can sign anyone
+    signup_email = email if current_user["role"] in ["staff", "admin"] else current_user["email"]
+
     # Validate student is not already signed up
-    if email in activity["participants"]:
+    if signup_email in activity["participants"]:
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
         )
 
     # Add student
-    activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+    activity["participants"].append(signup_email)
+    return {"message": f"Signed up {signup_email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, current_user: dict = Depends(get_current_user)):
+    """Unregister a student from an activity"""
+    require_role(current_user, ["student", "staff", "admin"])
+
+    # Validate activity exists
+    if activity_name not in activities:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Get the specific activity
+    activity = activities[activity_name]
+
+    target_email = email if current_user["role"] in ["staff", "admin"] else current_user["email"]
+
+    # Validate student is signed up
+    if target_email not in activity["participants"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Student is not signed up for this activity"
+        )
+
+    # Remove student
+    activity["participants"].remove(target_email)
+    return {"message": f"Unregistered {target_email} from {activity_name}"}
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
